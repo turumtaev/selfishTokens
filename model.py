@@ -283,7 +283,7 @@ class GPT(nn.Module):
         grad_logger.set_history("grad_adam_moments", torch.norm(grad_adam_moments, dim=-1))
         grad_logger.set_emb_prev(emb_current)
 
-    def forward(self, idx, targets=None, log_output_loss=False):
+    def forward(self, idx, targets=None, hard_negative_layout=-1, log_output_loss=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -300,8 +300,9 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             if not log_output_loss:
-                logits = self.pos_lm_head(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                pos_logits = self.pos_lm_head(x)
+                logits = pos_logits
+                
             else:
                 # calculate the same logits from 2 identical heads (they share weights)
                 pos_logits = self.pos_lm_head(x)
@@ -310,8 +311,17 @@ class GPT(nn.Module):
                 positive_mask = torch.arange(self.vocab_size).view(1, 1, -1) == targets.unsqueeze(-1)
                 # combine logits from 2 sources together
                 logits = torch.where(positive_mask, pos_logits, neg_logits)
+
+            if hard_negative_layout != -1:
+                threshold = torch.gather(logits, 2, targets.unsqueeze(-1)) - hard_negative_layout
+                # Set all values below the threshold to -inf
+                logits = torch.where(logits < threshold, torch.tensor(-float('Inf'), device=logits.device), logits)
+
+            if not log_output_loss:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-                self.log_output_loss(logits, targets)
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                self.log_output_loss(pos_logits, targets)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

@@ -75,6 +75,7 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 
 # new params
 log_output_loss = False
+hard_negative_layout = -1
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -300,7 +301,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y, log_output_loss=log_output_loss)
+            logits, loss = model(X, Y, hard_negative_layout=hard_negative_layout, log_output_loss=log_output_loss)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
