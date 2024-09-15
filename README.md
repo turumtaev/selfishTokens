@@ -28,14 +28,14 @@ Essentially, we need to ignore tokens with $ P(T) \ll P(\text{target}) $. To do 
 
 ```python
 # Pseudocode
-# For each target token, set a threshold as logits[target] - hard_negative_layout
-threshold = logits[targets] - hard_negative_layout
+# For each target token, set a threshold as logits[target] - layout
+threshold = logits[targets] - layout
 # Wipe out logits that are too small
 logits[logits < threshold] = -float('inf')
 ```
 
-Due to the softmax function, this threshold eliminates probabilities that are less than $P(\text{target}) \times e^{-\text{hard\_negative\_layout}}
-$. In my experiments, I used `hard_negative_layout=2`
+Due to the softmax function, this threshold eliminates probabilities that are less than $P(\text{target}) \times e^{-\text{layout}}
+$. In my experiments, I used `layout=2`
 
 ## Experiments
 
