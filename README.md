@@ -86,8 +86,21 @@ Next, we examine the top-1 accuracy for the different training methods:
 
 Here, we observe that the hard negative sampling approach significantly outperforms the baseline in the low-resource language data. Interestingly, it also performs slightly better on the high-resource language data, indicating that hard negative sampling may have beneficial effects even beyond low-resource scenarios.
 
-## TODO
+## Embeddings comparison
 
-- Compare t-SNE of Embeddings
-- Test with Larger Model and More Data:
+Below is a comparison of embedding positions after baseline training and hard negative sampling. These visualizations use a 2D t-SNE projection of the embedding vectors, where high-resource language embeddings are marked in blue, and low-resource language embeddings are marked in red. The `i-th` and `i+vocab_size` tokens are connected by lines.
+
+![TSNE comparison](assets/tsne.png)
+
+It's challenging to draw concrete conclusions from this visualization, so let's take a look at the PCA 2D projections to identify any interesting patterns.
+
+![PCA comparison](assets/pca.png)
+
+There are two clear directions in both sets of model embeddings. One direction separates the languages, while the other separates the rare tokens (the five least popular tokens are marked with an 'x' shape). However, in the model trained with hard negative sampling, the distances between languages and between rare and other tokens are smaller. This suggests that the tokens repel each other less and potentially learn more meaningful information during hard sampling training.
+
+Despite the reduced gap, the persistent separation between languages in the hard-sampling-trained model indicates that there is still room for a more aggressive layout selection during hard negative sampling.
+
+## TODO
+- Try more aggressive layout for hard negative sampling.
+- Test with Larger Model and More Data.
 - Evaluate with More Realistic Metrics, Nucleus Sampling?
