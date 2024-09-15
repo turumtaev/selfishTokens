@@ -72,7 +72,7 @@ I conducted three experiments to explore the effects of different training metho
 
 1. **Baseline**: Standard training process.
 2. **Hard Negative Sampling**: Training with hard negative sampling using a layout of 2.
-3 **Small-Language-Only Training**: A simulation of proportional compute distribution, where the model is trained solely on the low-resource language data for 50 times fewer steps than the baseline.
+3. **Small-Language-Only Training**: A simulation of proportional compute distribution, where the model is trained solely on the low-resource language data for 50 times fewer steps than the baseline.
 
 The plots below compare the losses across all data and specifically for the low-resource language data:
 
@@ -101,6 +101,6 @@ There are two clear directions in both sets of model embeddings. One direction s
 Despite the reduced gap, the persistent separation between languages in the hard-sampling-trained model indicates that there is still room for a more aggressive layout selection during hard negative sampling.
 
 ## TODO
-- Try more aggressive layout for hard negative sampling.
+- Try more aggressive layout for hard negative sampling. Layout Scheduling?
 - Test with Larger Model and More Data.
 - Evaluate with More Realistic Metrics, Nucleus Sampling?
