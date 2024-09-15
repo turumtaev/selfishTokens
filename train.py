@@ -74,8 +74,8 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
 # new params
-log_output_loss = False
 hard_negative_layout = -1
+big_language_prob = 0.98
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -117,18 +117,43 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+def get_batch(split, language='random', vocab_size=65):
+    # We recreate np.memmap every batch to avoid a memory leak
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    x_list = []
+    y_list = []
+    
+    for i in ix:
+        # Determine language for each individual sample if 'random' is specified
+        current_language = language
+        if language == 'random':
+            current_language = 'big' if torch.rand(1).item() < big_language_prob else 'small'
+        
+        # Get the input and target sequences
+        x_sample = torch.from_numpy((data[i:i + block_size]).astype(np.int64))
+        y_sample = torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64))
+        
+        # Modify x and y if the language is 'small'
+        if current_language == 'small':
+            x_sample = x_sample + vocab_size
+            y_sample = y_sample + vocab_size
+        
+        # Append to lists
+        x_list.append(x_sample)
+        y_list.append(y_sample)
+    
+    # Stack the lists into tensors
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+    
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        # Pin arrays x, y for asynchronous GPU transfer
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
@@ -156,9 +181,9 @@ if init_from == 'scratch':
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = meta_vocab_size * 2 if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf, max_iters+1)
+    model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -171,7 +196,7 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf, max_iters+1)
+    model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -220,14 +245,26 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split, language in [('train', 'random'), ('val', 'random'), ('val', 'big'), ('val', 'small')]:
         losses = torch.zeros(eval_iters)
+        accuracies = torch.zeros(eval_iters)
+        
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, language)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+            
+            # Calculate accuracy, ignoring indices of -1 in targets
+            predictions = logits.argmax(dim=-1)
+            valid_mask = (Y != -1)  # Mask to ignore -1 indices
+            correct = (predictions == Y) & valid_mask  # Check correct predictions, apply mask
+            accuracy = correct.sum().float() / valid_mask.sum().float()  # Calculate accuracy only on valid elements
+            accuracies[k] = accuracy.item()
+
+        out[('loss', split, language, )] = losses.mean().item()
+        out[('accuracy', split, language)] = accuracies.mean().item()
+
     model.train()
     return out
 
@@ -251,7 +288,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train', 'random') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -266,17 +303,25 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses[('loss', 'train', 'random')]:.4f}, val loss {losses[('loss', 'val', 'random')]:.4f}|{losses[('loss', 'val', 'big')]:.4f}|{losses[('loss', 'val', 'small')]:.4f}")
+        print(f"step {iter_num}: train loss {losses[('accuracy', 'train', 'random')]:.4f}, val loss {losses[('accuracy', 'val', 'random')]:.4f}|{losses[('accuracy', 'val', 'big')]:.4f}|{losses[('accuracy', 'val', 'small')]:.4f}")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/loss": losses[('loss', 'train', 'random')],
+                "val/loss/random": losses[('loss', 'val', 'random')],
+                "val/loss/big": losses[('loss', 'val', 'big')],
+                "val/loss/small": losses[('loss', 'val', 'small')],
+                "train/accuracy": losses[('accuracy', 'train', 'random')],
+                "val/accuracy/random": losses[('accuracy', 'val', 'random')],
+                "val/accuracy/big": losses[('accuracy', 'val', 'big')],
+                "val/accuracy/small": losses[('accuracy', 'val', 'small')],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if losses[('loss', 'val', 'random')] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses[('loss', 'val', 'random')]
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -301,10 +346,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y, hard_negative_layout=hard_negative_layout, log_output_loss=log_output_loss)
+            logits, loss = model(X, Y, hard_negative_layout=hard_negative_layout)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = get_batch('train', 'random')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -315,8 +360,6 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    if log_output_loss:
-        raw_model.log_grads(lr, weight_decay)
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -330,16 +373,13 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, hard_negative_layout {hard_negative_layout}")
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
-
-grad_logger_state_dict_path = os.path.join(out_dir, 'grad_logger_state_dict.pth')
-model.grad_logger.save_state_dict(grad_logger_state_dict_path)
 
 if ddp:
     destroy_process_group()

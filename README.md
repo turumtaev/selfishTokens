@@ -1,6 +1,6 @@
 # Selfish Tokens: Hard Negative Sampling to Improve the Performance of Language Models in Low-Resource Languages
 
-Some studies (e.g., [this paper]((https://arxiv.org/pdf/2306.16842))) have shown a correlation between the performance of language models and the entropy of the token distribution.
+Some studies (e.g., [this paper](https://arxiv.org/pdf/2306.16842)) have shown a correlation between the performance of language models and the entropy of the token distribution.
 
 At the same time, the distribution of languages in text corpora is not uniform. For example, [GPT-3 was trained on data](https://github.com/openai/gpt-3/blob/master/dataset_statistics/languages_by_word_count.csv) where less than 2% of tokens are in the second most popular language (French)
 
@@ -22,7 +22,7 @@ Scenario 2.2 is unique because it affects all tokens, regardless of their presen
 
 To reduce the "noise" from scenario 2.2, I propose a method to make tokens more "selfish" and focus more on scenarios 1 and 2.1, where tokens have meaningful contexts to learn from. To achieve this, I add a simple step after the language model (LM) head before calculating the cross-entropy loss.
 
-Suppose the LM predicts the target token with probability $P(\text{target})$. If there are any tokens that have predicted probabilities greater than $P(\text{target})$, it makes sense to push their probabilities down to zero. However, for a token **T** where $P(T) \ll p$, it is already sufficiently far from the target token, and we may ignore it—allowing such "distant" tokens to be optimized in their own contexts.
+Suppose the LM predicts the target token with probability $P(\text{target})$. If there are any tokens that have predicted probabilities greater than $P(\text{target})$, it makes sense to push their probabilities down to zero. However, for a token **T** where $P(T) \ll P(target)$, it is already sufficiently far from the target token, and we may ignore it—allowing such "distant" tokens to be optimized in their own contexts.
 
 Essentially, we need to ignore tokens with $P(T) \ll P(\text{target})$. To do this, I implement the following:
 
@@ -62,3 +62,32 @@ When we look at the less popular tokens, however, the results are different. Her
 
 This suggests that while standard training excels with frequent tokens, hard negative sampling provides an advantage in learning more meaningful representations for rare tokens.
 
+## Training multilangual LM simulation
+
+To simulate multilingual data, I adjusted 2% of the dataset to represent a low-resource language by modifying the token IDs: `token_id += vocab_size`. This creates two distinct sets of tokens:
+- 98% of the data uses an alphabet within the range [0, vocab_size), simulating a high-resource language.
+- 2% of the data uses an alphabet within [vocab_size, 2*vocab_size), representing a low-resource language.
+
+I conducted three experiments to explore the effects of different training methods:
+
+1. **Baseline**: Standard training process.
+2. **Hard Negative Sampling**: Training with hard negative sampling using a layout of 2.
+3 **Small-Language-Only Training**: A simulation of proportional compute distribution, where the model is trained solely on the low-resource language data for 50 times fewer steps than the baseline.
+
+The plots below compare the losses across all data and specifically for the low-resource language data:
+
+![loss](assets/loss.png)
+
+The baseline training achieves a better loss overall. However, when focusing on the low-resource data, the losses for the baseline and hard negative sampling methods are quite similar.
+
+Next, we examine the top-1 accuracy for the different training methods:
+
+![accuracy](assets/accuracy.png)
+
+Here, we observe that the hard negative sampling approach significantly outperforms the baseline in the low-resource language data. Interestingly, it also performs slightly better on the high-resource language data, indicating that hard negative sampling may have beneficial effects even beyond low-resource scenarios.
+
+## TODO
+
+- Compare t-SNE of Embeddings
+- Test with Larger Model and More Data:
+- Evaluate with More Realistic Metrics, Nucleus Sampling?
