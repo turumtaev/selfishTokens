@@ -72,6 +72,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+# new params
+log_output_loss = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -154,7 +157,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = GPT(gptconf, max_iters+1)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -167,7 +170,7 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = GPT(gptconf, max_iters+1)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -297,7 +300,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, log_output_loss=log_output_loss)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -311,6 +314,8 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
+    if log_output_loss:
+        raw_model.log_grads(lr, weight_decay)
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -331,6 +336,9 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+grad_logger_state_dict_path = os.path.join(out_dir, 'grad_logger_state_dict.pth')
+model.grad_logger.save_state_dict(grad_logger_state_dict_path)
 
 if ddp:
     destroy_process_group()
