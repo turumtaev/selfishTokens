@@ -143,7 +143,7 @@ It's expected that the baseline has a lower loss due to the presence of long tai
 
 In the model with hard negative sampling, even though the probabilities for many tokens are lower than the threshold, they are not optimized further. Consequently, these probabilities remain higher than those from the baseline model. This long tail of probabilities reduces the probability of the target token and increases the loss for the model with hard negative sampling.
 
-Modern language models widely use sampling techniques like top-k sampling or nucleus sampling to eliminate the "unreliable tail" of low-probability tokens. If we set a `top_p` for nucleus sampling that we will use later, with a large enough margin, we can train the model to optimize non-target tokens \( T \) so that \( P(T) \) decreases until it is outside of `top_p`.
+Modern language models widely use sampling techniques like top-k sampling or nucleus sampling to eliminate the ["unreliable tail"](https://arxiv.org/pdf/1904.09751) of low-probability tokens. If we set a `top_p` for nucleus sampling that we will use later, with a large enough margin, we can train the model to optimize non-target tokens \( T \) so that \( P(T) \) decreases until it is outside of `top_p`.
 
 **Lemma**:
 
@@ -184,7 +184,7 @@ $$
 \text{margin} = \ln(200{,}000) - \ln(0.01) \approx 16.8.
 $$
 
-Between this large margin and a small margin (which adversely affects the loss), there should be a balanced choice that doesn't harm the loss too much while still improving performance for low-resource languages. Determining the optimal margin is a trade-off: a larger margin reduces the impact of irrelevant tokens but might not provide sufficient optimization for rare tokens. A smaller margin could spoil the loss without adequately benefiting the low-resource tokens.
+Between this large margin and a small margin (which adversely affects the loss), there should be a balanced choice that doesn't harm the loss too much while still improving performance for low-resource languages.
 
 ## Hard negative sampling improve ranking of target tokens:
 
