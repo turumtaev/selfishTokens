@@ -115,6 +115,54 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+def softminus(logits, threshold, c=1):
+        mask = logits > threshold
+        new_logits = torch.full_like(logits, float('-inf'))  # Initialize the result tensor with -inf
+        expanded_threshold = threshold.expand_as(logits)
+        # new_logits[mask] = c * torch.log(torch.exp((logits[mask] - expanded_threshold[mask])/c) - 1) + expanded_threshold[mask]
+        new_logits[mask] = c * torch.log(torch.maximum(torch.tensor(1e-9, dtype=logits.dtype, device=logits.device), 
+                                                torch.exp((logits[mask] - expanded_threshold[mask]) / c) - 1)) + expanded_threshold[mask]
+
+        return new_logits
+
+def reverted_elu(logits, threshold):
+    mask_linear = (threshold + 1) < logits
+    mask_ln = (threshold < logits) & (logits  <= (threshold + 1))
+    new_logits = torch.full_like(logits, float('-inf'))  # Initialize the result tensor with -inf
+    expanded_threshold = threshold.expand_as(logits)
+    new_logits[mask_linear] = logits[mask_linear]
+    new_logits[mask_ln] =  torch.log(logits[mask_ln] - expanded_threshold[mask_ln]) + expanded_threshold[mask_ln] + 1
+    return new_logits
+
+def top_p_and_threshold_filtering(logits, threshold=None, top_p=0.0, filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (vocabulary size)
+            top_k >0: keep only top k tokens with highest probability (top-k filtering).
+            top_p >0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+        
+        Basic outline taken from https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
+    """
+    
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    # Remove tokens with cumulative probability above the threshold
+    sorted_indices_to_remove = cumulative_probs > top_p
+    # Shift the indices to the right to keep also the first token above the threshold
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+    
+    indices_to_remove_top_p = torch.gather(sorted_indices_to_remove, 2, sorted_indices.argsort(-1))
+    if threshold is not None:
+        indices_to_remove_threshold = logits < threshold
+        indices_to_remove = indices_to_remove_top_p & indices_to_remove_threshold
+    else:
+        indices_to_remove = indices_to_remove_top_p
+    logits = torch.where(indices_to_remove, filter_value, logits)
+    return logits
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -187,8 +235,9 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             if hard_negative_layout != -1:
                 threshold = torch.gather(logits, 2, targets.unsqueeze(-1)) - hard_negative_layout
-                # Set all values below the threshold to -inf
-                logits = torch.where(logits < threshold, torch.tensor(-float('Inf'), device=logits.device), logits)
+                logits = top_p_and_threshold_filtering(logits, threshold=threshold, top_p=0.95, filter_value=torch.tensor(-float('Inf'), device=logits.device))
+                # logits = torch.where(logits < threshold, torch.tensor(-float('Inf'), device=logits.device), logits)
+                # logits = softminus(logits, threshold, 5)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

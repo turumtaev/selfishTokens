@@ -26,8 +26,9 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn import functional as F
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, top_p_and_threshold_filtering
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -76,6 +77,7 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # new params
 hard_negative_layout = -1
 big_language_prob = 0.98
+hard_negative_warmup = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -248,25 +250,55 @@ def estimate_loss():
     for split, language in [('train', 'random'), ('val', 'random'), ('val', 'big'), ('val', 'small')]:
         losses = torch.zeros(eval_iters)
         accuracies = torch.zeros(eval_iters)
+        recalls_at_k = torch.zeros(eval_iters)
+        mrrs = torch.zeros(eval_iters)
         
-        for k in range(eval_iters):
-            X, Y = get_batch(split, language)
+        k = 5  # Define the value of k for the ranking metrics
+
+        for i in range(eval_iters):
+            X, Y = get_batch(split, language)  # Y shape: (batch_size, seq_len)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-            
+                logits, loss = model(X, Y)  # logits shape: (batch_size, seq_len, vocab_size)
+            losses[i] = loss.item()
+            if hard_negative_layout:
+                logits_max, _ = torch.max(logits, dim=-1, keepdim=True)
+                threshold = logits_max - hard_negative_layout
+                logits_sampled = logits.clone()
+                logits_sampled = top_p_and_threshold_filtering(logits_sampled, threshold=None, top_p=0.95,
+                                                                filter_value=torch.tensor(threshold - 10, device=logits.device))
+                loss_sampled = F.cross_entropy(logits_sampled.view(-1, logits_sampled.size(-1)), Y.view(-1), ignore_index=-1)
+                losses[i] = loss_sampled.item()
+
             # Calculate accuracy, ignoring indices of -1 in targets
-            predictions = logits.argmax(dim=-1)
-            valid_mask = (Y != -1)  # Mask to ignore -1 indices
+            predictions = logits.argmax(dim=-1)  # Shape: (batch_size, seq_len)
+            valid_mask = (Y != -1)  # Mask to ignore -1 indices, shape: (batch_size, seq_len)
             correct = (predictions == Y) & valid_mask  # Check correct predictions, apply mask
             accuracy = correct.sum().float() / valid_mask.sum().float()  # Calculate accuracy only on valid elements
-            accuracies[k] = accuracy.item()
+            accuracies[i] = accuracy.item()
 
-        out[('loss', split, language, )] = losses.mean().item()
+            # Calculate rank of each target in the logits
+            sorted_logits = logits.argsort(dim=-1, descending=True)  # Shape: (batch_size, seq_len, vocab_size)
+            target_ranks = torch.where(sorted_logits == Y.unsqueeze(-1))[2] + 1  # Find rank positions (+1 for 1-based rank)
+
+            # Flatten the tensors and apply the valid mask
+            target_ranks = target_ranks.view(-1)[valid_mask.view(-1)]  # Filter ranks using the valid mask
+
+            # Calculate Recall@k
+            recalls_at_k[i] = (target_ranks <= k).float().mean().item()
+
+            # Calculate MRR
+            reciprocal_ranks = 1.0 / target_ranks.float()
+            mrrs[i] = reciprocal_ranks.mean().item()
+
+        out[('loss', split, language)] = losses.mean().item()
         out[('accuracy', split, language)] = accuracies.mean().item()
+        out[('recall@5', split, language)] = recalls_at_k.mean().item()
+        out[('mrr', split, language)] = mrrs.mean().item()
 
     model.train()
     return out
+
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -297,6 +329,12 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
+
+    if hard_negative_warmup and iter_num < warmup_iters:
+        current_hard_negative_layout = -1
+    else:
+        current_hard_negative_layout = hard_negative_layout
+
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -307,19 +345,15 @@ while True:
         print(f"step {iter_num}: train loss {losses[('accuracy', 'train', 'random')]:.4f}, val loss {losses[('accuracy', 'val', 'random')]:.4f}|{losses[('accuracy', 'val', 'big')]:.4f}|{losses[('accuracy', 'val', 'small')]:.4f}")
         
         if wandb_log:
-            wandb.log({
+            to_log = {
                 "iter": iter_num,
-                "train/loss": losses[('loss', 'train', 'random')],
-                "val/loss/random": losses[('loss', 'val', 'random')],
-                "val/loss/big": losses[('loss', 'val', 'big')],
-                "val/loss/small": losses[('loss', 'val', 'small')],
-                "train/accuracy": losses[('accuracy', 'train', 'random')],
-                "val/accuracy/random": losses[('accuracy', 'val', 'random')],
-                "val/accuracy/big": losses[('accuracy', 'val', 'big')],
-                "val/accuracy/small": losses[('accuracy', 'val', 'small')],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            for metric_name in ['loss', 'accuracy', 'recall@5', 'mrr']:
+                for split, language in [('train', 'random'), ('val', 'random'), ('val', 'big'), ('val', 'small')]:
+                    to_log[f'{split}/{metric_name}/{language}'] = losses[(metric_name, split, language)]
+            wandb.log(to_log)
         if losses[('loss', 'val', 'random')] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses[('loss', 'val', 'random')]
             if iter_num > 0:
@@ -346,7 +380,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y, hard_negative_layout=hard_negative_layout)
+            logits, loss = model(X, Y, hard_negative_layout=current_hard_negative_layout)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train', 'random')
@@ -373,7 +407,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, hard_negative_layout {hard_negative_layout}")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, hard_negative_layout {current_hard_negative_layout}")
     iter_num += 1
     local_iter_num += 1
 
